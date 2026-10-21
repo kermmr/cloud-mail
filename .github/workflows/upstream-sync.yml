@@ -63,3 +63,32 @@ jobs:
             fi
             git push origin "$DEFAULT_BRANCH"
           fi
+
+      - name: Ensure KV/D1 bindings in wrangler.toml
+        env:
+          DEFAULT_BRANCH: ${{ steps.repo_info.outputs.default_branch }}
+        run: |
+          # 守护云邮件实例的 KV/D1 绑定：绑定只写在 wrangler.toml 里才不会被部署清掉。
+          # 上游若改写/重排过该文件，这里自动补回去并提交，避免再次“自动更新后 KV 掉了”。
+          F=mail-worker/wrangler.toml
+          changed=0
+
+          if ! grep -q "fbaba59f537941b7b51d99d86e5c29f0" "$F"; then
+            printf '\n[[kv_namespaces]]\nbinding = "kv"\nid = "fbaba59f537941b7b51d99d86e5c29f0"\n' >> "$F"
+            changed=1
+          fi
+
+          if ! grep -q "a39a6ffe-e816-4ea9-a1f9-64a245c6c8a8" "$F"; then
+            printf '\n[[d1_databases]]\nbinding = "db"\ndatabase_name = "cloudmail"\ndatabase_id = "a39a6ffe-e816-4ea9-a1f9-64a245c6c8a8"\n' >> "$F"
+            changed=1
+          fi
+
+          if [ "$changed" = "1" ]; then
+            git add "$F"
+            git -c user.name="GH Action - Upstream Sync" -c user.email="action@github.com" \
+              commit -m "chore: restore KV/D1 bindings in wrangler.toml"
+            git push origin "$DEFAULT_BRANCH"
+            echo "补回 KV/D1 绑定并已推送。"
+          else
+            echo "KV/D1 绑定存在，无需修改。"
+          fi
