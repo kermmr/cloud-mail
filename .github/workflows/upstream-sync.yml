@@ -5,8 +5,12 @@ permissions:
 
 on:
   schedule:
-    - cron: "0 0 * * *" # 每天 UTC 0点执行，可自行调整
+    - cron: "0 0 * * *" # 每天 UTC 0 点，可自行调整
   workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
 
 jobs:
   sync_latest_from_upstream:
@@ -20,16 +24,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          UPSTREAM_URL=$(gh api "repos/${{ github.repository }}" --jq '.parent.clone_url')
-          DEFAULT_BRANCH=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
+          UPSTREAM_URL=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.clone_url')
+          DEFAULT_BRANCH=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')
 
           if [ -z "$UPSTREAM_URL" ] || [ "$UPSTREAM_URL" = "null" ]; then
-            echo "[Error] 无法检测到父仓库（该仓库可能不是 fork），同步已取消。"
+            echo "::error::无法检测到父仓库（该仓库可能不是 fork），同步已取消。"
             exit 1
           fi
 
-          echo "upstream_url=$UPSTREAM_URL" >> "$GITHUB_OUTPUT"
-          echo "default_branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+          {
+            echo "upstream_url=$UPSTREAM_URL"
+            echo "default_branch=$DEFAULT_BRANCH"
+          } >> "$GITHUB_OUTPUT"
+
           echo "检测到上游仓库: $UPSTREAM_URL"
           echo "检测到默认分支: $DEFAULT_BRANCH"
 
@@ -38,28 +45,52 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ steps.repo_info.outputs.default_branch }}
+          # 配了 SYNC_TOKEN（带 workflow 权限的 PAT）才用自定义 token，
+          # 否则用默认 GITHUB_TOKEN。
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Sync upstream changes
         env:
           UPSTREAM_URL: ${{ steps.repo_info.outputs.upstream_url }}
           DEFAULT_BRANCH: ${{ steps.repo_info.outputs.default_branch }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
+          set -euo pipefail
+
           git config user.name "GH Action - Upstream Sync"
           git config user.email "action@github.com"
 
           git remote add upstream "$UPSTREAM_URL"
           git fetch upstream "$DEFAULT_BRANCH"
 
-          if git diff --quiet HEAD "upstream/$DEFAULT_BRANCH"; then
-            # 内容和上游一致，直接对齐，顺带清理历史分叉留下的多余 merge commit
-            git reset --hard "upstream/$DEFAULT_BRANCH"
-            git push --force-with-lease origin "$DEFAULT_BRANCH"
-          else
-            # 有本地修改，保持原来的合并方式，不覆盖任何人的改动
-            if ! git pull --no-rebase upstream "$DEFAULT_BRANCH"; then
-              echo "[Error] 合并上游变更产生冲突，自动同步已暂停，请手动 Sync Fork 并解决冲突。"
-              echo "[Error] Merge conflict detected while syncing upstream. Please sync your fork manually and resolve the conflicts."
-              exit 1
-            fi
-            git push origin "$DEFAULT_BRANCH"
+          if git merge-base --is-ancestor "upstream/$DEFAULT_BRANCH" HEAD; then
+            echo "✅ 已包含上游全部提交，无需同步。"
+            exit 0
           fi
+
+          BEFORE=$(git rev-parse HEAD)
+
+          if ! git merge --no-edit "upstream/$DEFAULT_BRANCH"; then
+            git merge --abort || true
+            echo "::error::合并上游变更出现冲突，自动同步已暂停，请手动解决冲突后再运行。"
+            echo "::error::Merge conflict detected while syncing upstream. Please resolve the conflicts manually."
+            exit 1
+          fi
+
+          # GITHUB_TOKEN 没有 workflows 权限：只要上游改过 .github/workflows 里的文件，
+          # git push 就会被拒（refusing to allow a GitHub App to create or update workflow）。
+          # 这里把工作流目录还原成本仓库自己的版本，让这次推送不再包含 workflow 改动，
+          # 上游其它所有代码改动照常同步。（配了 SYNC_TOKEN 时跳过，保留上游工作流改动。）
+          if [ -z "${SYNC_TOKEN}" ]; then
+            git rm -r -q --ignore-unmatch .github/workflows
+            if git cat-file -e "${BEFORE}:.github/workflows" 2>/dev/null; then
+              git checkout "$BEFORE" -- .github/workflows
+            fi
+            if ! git diff --cached --quiet; then
+              git commit --amend --no-edit
+              echo "ℹ️ 上游的 workflow 文件改动已忽略，继续沿用本仓库版本。"
+            fi
+          fi
+
+          git push origin "HEAD:$DEFAULT_BRANCH"
+          echo "✅ 同步完成：$(git rev-parse --short HEAD)"
