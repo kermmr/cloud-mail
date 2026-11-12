@@ -70,11 +70,25 @@ jobs:
 
           BEFORE=$(git rev-parse HEAD)
 
+          # 合并上游。本仓库代码与上游一致，冲突只会出现在 .github/workflows；
+          # 这些路径一律保留本仓库版本，同步永远不会因为工作流文件卡住。
           if ! git merge --no-edit "upstream/$DEFAULT_BRANCH"; then
-            git merge --abort || true
-            echo "::error::合并上游变更出现冲突，自动同步已暂停，请手动解决冲突后再运行。"
-            echo "::error::Merge conflict detected while syncing upstream. Please resolve the conflicts manually."
-            exit 1
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            OUTSIDE=$(echo "$CONFLICTS" | grep -v '^\.github/workflows/' || true)
+            if [ -n "$OUTSIDE" ]; then
+              git merge --abort || true
+              echo "::error::以下文件与上游冲突，需要人工处理："
+              echo "$OUTSIDE"
+              exit 1
+            fi
+            echo "ℹ️ 工作流文件冲突，保留本仓库版本："
+            echo "$CONFLICTS"
+            git rm -r -q -f --ignore-unmatch .github/workflows
+            if git cat-file -e "${BEFORE}:.github/workflows" 2>/dev/null; then
+              git checkout "$BEFORE" -- .github/workflows
+            fi
+            git add -A .github/workflows
+            git commit --no-edit
           fi
 
           # GITHUB_TOKEN 没有 workflows 权限：只要上游改过 .github/workflows 里的文件，
